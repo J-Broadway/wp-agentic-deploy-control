@@ -1,0 +1,282 @@
+name: Deploy production
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Full 40-character source commit SHA
+        required: true
+        type: string
+      artifact_digest:
+        description: Immutable sha256 OCI digest
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+jobs:
+  validate-inputs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Validate immutable deployment inputs
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          ARTIFACT_DIGEST: ${{ inputs.artifact_digest }}
+        run: |
+          set -Eeuo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            printf 'Invalid source commit SHA.\n' >&2
+            exit 1
+          }
+          [[ "$ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+            printf 'Invalid OCI digest.\n' >&2
+            exit 1
+          }
+
+  deploy:
+    needs: validate-inputs
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: read
+    env:
+      SOURCE_SHA: ${{ inputs.source_sha }}
+      ARTIFACT_DIGEST: ${{ inputs.artifact_digest }}
+      OCI_PACKAGE: ghcr.io/j-broadway/wp-agentic-test-production
+      DEPLOY_ROOT: /home/1655427.cloudwaysapps.com/ggpjvxscfe/public_html
+      SSH_USER: ggpjvxscfe
+      SSH_HOST: ${{ vars.PRODUCTION_SSH_HOST }}
+      SSH_PORT: ${{ vars.PRODUCTION_SSH_PORT }}
+      SSH_KNOWN_HOST_LINE: ${{ vars.PRODUCTION_SSH_KNOWN_HOST_LINE }}
+      SSH_HOST_KEY_FINGERPRINT: ${{ vars.PRODUCTION_SSH_HOST_KEY_FINGERPRINT }}
+      APPLICATION_URL: ${{ vars.APPLICATION_URL }}
+      MEDIA_SMOKE_PATH: ${{ vars.MEDIA_SMOKE_PATH }}
+      CLOUDWAYS_SERVER_ID: ${{ vars.CLOUDWAYS_SERVER_ID }}
+      CLOUDWAYS_APP_ID: '6588863'
+
+    steps:
+      - name: Set up ORAS
+        uses: oras-project/setup-oras@v1
+
+      - name: Download exact OCI digest
+        run: |
+          set -Eeuo pipefail
+          mkdir candidate
+          oras pull "${OCI_PACKAGE}@${ARTIFACT_DIGEST}" --output candidate
+
+      - name: Verify artifact provenance and contents
+        run: |
+          set -Eeuo pipefail
+          archive="candidate/dist/wordpress-${SOURCE_SHA}.tar.gz"
+          checksum="${archive}.sha256"
+          external_manifest="candidate/dist/release-manifest.json"
+          [[ -f "$archive" && -f "$checksum" && -f "$external_manifest" ]]
+
+          (
+            cd candidate/dist
+            sha256sum --check --strict "wordpress-${SOURCE_SHA}.tar.gz.sha256"
+          )
+
+          manifest_sha=$(jq -er '.sourceCommit' "$external_manifest")
+          [[ "$manifest_sha" = "$SOURCE_SHA" ]]
+
+          while IFS= read -r archive_path; do
+            archive_path=${archive_path#./}
+            [[ -n "$archive_path" && "$archive_path" != /* ]]
+            [[ "$archive_path" != '..' && "$archive_path" != ../* && "$archive_path" != */../* ]]
+          done < <(tar -tzf "$archive")
+          if tar -tvzf "$archive" | awk '$1 ~ /^[lh]/ { found=1 } END { exit !found }'; then
+            printf 'Artifact contains links.\n' >&2
+            exit 1
+          fi
+
+          mkdir verified
+          tar -xzf "$archive" -C verified --no-same-owner --no-same-permissions
+          cmp --silent "$external_manifest" verified/release-manifest.json
+          [[ "$(jq -er '.sourceCommit' verified/release-manifest.json)" = "$SOURCE_SHA" ]]
+
+          inventory_hash=$(sha256sum verified/release-files.sha256 | awk '{print $1}')
+          [[ "$inventory_hash" = "$(jq -er '.fileInventorySha256' verified/release-manifest.json)" ]]
+          while IFS= read -r line; do
+            [[ "$line" =~ ^[0-9a-f]{64}\ \  ]]
+            relative_path=${line:66}
+            [[ -n "$relative_path" && "$relative_path" != /* ]]
+            [[ "$relative_path" != *'..'* && "$relative_path" != *\\* ]]
+            [[ -f "verified/$relative_path" && ! -L "verified/$relative_path" ]]
+          done < verified/release-files.sha256
+          (
+            cd verified
+            sha256sum --check --quiet release-files.sha256
+          )
+
+          for forbidden in \
+            verified/.env \
+            verified/web/app/uploads \
+            verified/web/app/advanced-cache.php \
+            verified/web/app/object-cache.php \
+            verified/web/app/breeze-config; do
+            [[ ! -e "$forbidden" && ! -L "$forbidden" ]]
+          done
+          ! grep -RIlE '/var/www/html|/home/[^/]+/[^/]+/public_html' verified >/dev/null
+
+      - name: Configure pinned SSH identity
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.PRODUCTION_SSH_PRIVATE_KEY }}
+        run: |
+          set -Eeuo pipefail
+          [[ -n "$SSH_PRIVATE_KEY" ]]
+          [[ "$SSH_PORT" =~ ^[0-9]{1,5}$ ]]
+          [[ "$SSH_HOST" =~ ^[A-Za-z0-9.-]+$ ]]
+          [[ "$SSH_HOST_KEY_FINGERPRINT" =~ ^SHA256:[A-Za-z0-9+/=]+$ ]]
+          [[ -n "$SSH_KNOWN_HOST_LINE" ]]
+
+          install -d -m 0700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          printf '%s\n' "$SSH_KNOWN_HOST_LINE" > ~/.ssh/known_hosts
+          chmod 0600 ~/.ssh/deploy_key ~/.ssh/known_hosts
+
+          actual_fingerprints=$(ssh-keygen -lf ~/.ssh/known_hosts -E sha256 | awk '{print $2}' | sort -u)
+          [[ "$actual_fingerprints" = "$SSH_HOST_KEY_FINGERPRINT" ]] || {
+            printf 'Pinned SSH host fingerprint mismatch.\n' >&2
+            exit 1
+          }
+
+      - name: Create Cloudways application backup
+        timeout-minutes: 30
+        env:
+          CLOUDWAYS_API_TOKEN: ${{ secrets.CLOUDWAYS_API_TOKEN }}
+        run: verified/scripts/cloudways-backup.sh
+
+      - name: Upload and activate verified release
+        id: activate
+        timeout-minutes: 20
+        run: |
+          set -Eeuo pipefail
+          release="$(date -u '+%Y%m%dT%H%M%SZ')-${SOURCE_SHA:0:12}"
+          printf 'release=%s\n' "$release" >> "$GITHUB_OUTPUT"
+
+          mkdir -p upload/control/lib
+          cp "candidate/dist/wordpress-${SOURCE_SHA}.tar.gz" upload/artifact.tar.gz
+          archive_hash=$(sha256sum upload/artifact.tar.gz | awk '{print $1}')
+          printf '%s  artifact.tar.gz\n' "$archive_hash" > upload/artifact.tar.gz.sha256
+          cp verified/scripts/deploy-release.sh verified/scripts/install-artifact.sh upload/control/
+          cp verified/scripts/lib/release-common.sh upload/control/lib/
+
+          ssh_options=(
+            -i "$HOME/.ssh/deploy_key"
+            -p "$SSH_PORT"
+            -o BatchMode=yes
+            -o IdentitiesOnly=yes
+            -o StrictHostKeyChecking=yes
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts"
+            -o ConnectTimeout=20
+          )
+          remote="${SSH_USER}@${SSH_HOST}"
+
+          ssh "${ssh_options[@]}" "$remote" \
+            'set -Eeuo pipefail
+             root=$1
+             release=$2
+             [[ "$release" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$ ]]
+             [[ "$root" = /home/1655427.cloudwaysapps.com/ggpjvxscfe/public_html ]]
+             install -d -m 0755 "$root/releases/.incoming-$release"' \
+            -- "$DEPLOY_ROOT" "$release"
+
+          rsync \
+            --archive \
+            --compress \
+            --partial \
+            -e "ssh -i $HOME/.ssh/deploy_key -p $SSH_PORT -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts" \
+            upload/ \
+            "${remote}:${DEPLOY_ROOT}/releases/.incoming-${release}/"
+
+          ssh "${ssh_options[@]}" "$remote" \
+            'set -Eeuo pipefail
+             root=$1
+             release=$2
+             application_url=$3
+             media_path=$4
+             active_wp="$root/current/web/wp"
+             if [[ ! -L "$root/current" ]]; then
+               active_wp="$root/web/wp"
+             fi
+             export DEPLOY_ROOT="$root"
+             export ACTIVE_WP_PATH="$active_wp"
+             export APPLICATION_URL="$application_url"
+             export MEDIA_SMOKE_PATH="$media_path"
+             export RUNTIME_GROUP=www-data
+             "$root/releases/.incoming-$release/control/deploy-release.sh" "$release"' \
+            -- "$DEPLOY_ROOT" "$release" "$APPLICATION_URL" "$MEDIA_SMOKE_PATH"
+
+      - name: Purge Cloudways application cache
+        timeout-minutes: 5
+        env:
+          CLOUDWAYS_API_TOKEN: ${{ secrets.CLOUDWAYS_API_TOKEN }}
+        run: verified/scripts/cloudways-purge-cache.sh
+
+      - name: Verify production after external cache purge
+        timeout-minutes: 5
+        env:
+          RELEASE: ${{ steps.activate.outputs.release }}
+        run: |
+          set -Eeuo pipefail
+          ssh_options=(
+            -i "$HOME/.ssh/deploy_key"
+            -p "$SSH_PORT"
+            -o BatchMode=yes
+            -o IdentitiesOnly=yes
+            -o StrictHostKeyChecking=yes
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts"
+          )
+          ssh "${ssh_options[@]}" "${SSH_USER}@${SSH_HOST}" \
+            'set -Eeuo pipefail
+             export DEPLOY_ROOT=$1
+             export EXPECTED_RELEASE=$2
+             export APPLICATION_URL=$3
+             export MEDIA_SMOKE_PATH=$4
+             "$1/current/scripts/smoke-production.sh"' \
+            -- "$DEPLOY_ROOT" "$RELEASE" "$APPLICATION_URL" "$MEDIA_SMOKE_PATH"
+
+      - name: Roll back after post-activation failure
+        id: rollback
+        if: failure() && steps.activate.outcome == 'success'
+        timeout-minutes: 10
+        env:
+          FAILED_RELEASE: ${{ steps.activate.outputs.release }}
+        run: |
+          set -Eeuo pipefail
+          ssh_options=(
+            -i "$HOME/.ssh/deploy_key"
+            -p "$SSH_PORT"
+            -o BatchMode=yes
+            -o IdentitiesOnly=yes
+            -o StrictHostKeyChecking=yes
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts"
+          )
+          ssh "${ssh_options[@]}" "${SSH_USER}@${SSH_HOST}" \
+            'set -Eeuo pipefail
+             root=$1
+             previous=$(<"$root/.previous-release")
+             [[ "$previous" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$ ]]
+             export DEPLOY_ROOT="$root"
+             export APPLICATION_URL=$2
+             export MEDIA_SMOKE_PATH=$3
+             "$root/current/scripts/rollback-release.sh" "$previous"' \
+            -- "$DEPLOY_ROOT" "$APPLICATION_URL" "$MEDIA_SMOKE_PATH"
+
+      - name: Purge external cache after rollback
+        if: always() && steps.rollback.outcome == 'success'
+        timeout-minutes: 5
+        env:
+          CLOUDWAYS_API_TOKEN: ${{ secrets.CLOUDWAYS_API_TOKEN }}
+        run: verified/scripts/cloudways-purge-cache.sh
