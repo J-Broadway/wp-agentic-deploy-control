@@ -42,9 +42,17 @@ channel. The workflow never runs `ssh-keyscan`.
 
 ## Private package access
 
-Grant this public repository Actions access to the private GHCR package
-`wp-agentic-test-production` (package settings → Manage Actions access) before
-dispatching a real digest. Until that grant exists, digest pulls fail closed.
+GitHub’s package-repository link APIs return 404 for this user-owned private
+container package, so Actions access must be granted in the UI:
+
+1. Open
+   `https://github.com/users/J-Broadway/packages/container/wp-agentic-test-production/settings`
+2. Under **Manage Actions access**, click **Add repository**
+3. Select `J-Broadway/wp-agentic-deploy-control`
+4. Set role to **Read**
+
+Until that grant exists, `oras pull` with the job `GITHUB_TOKEN` fails closed
+(`denied` / `not found`). Do not substitute a broad personal access token.
 
 ## Operating rule
 
