@@ -68,6 +68,13 @@ jobs:
       - name: Set up ORAS
         uses: oras-project/setup-oras@v1
 
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Download exact OCI digest
         run: |
           set -Eeuo pipefail
