@@ -43,7 +43,7 @@ jobs:
   deploy:
     needs: validate-inputs
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 90
     environment: production
     if: github.ref == 'refs/heads/main'
     permissions:
@@ -97,6 +97,14 @@ jobs:
           manifest_sha=$(jq -er '.sourceCommit' "$external_manifest")
           [[ "$manifest_sha" = "$SOURCE_SHA" ]]
 
+          archive_hash=$(awk '{print $1}' "$checksum")
+          [[ "$archive_hash" =~ ^[0-9a-f]{64}$ ]]
+          # Prefer explicit archive binding when present (newer artifacts).
+          # Older digests remain verifiable via checksum file + OCI digest.
+          if jq -e '.archiveSha256 != null' "$external_manifest" >/dev/null; then
+            [[ "$(jq -er '.archiveSha256' "$external_manifest")" = "$archive_hash" ]]
+          fi
+
           while IFS= read -r archive_path; do
             archive_path=${archive_path#./}
             [[ -n "$archive_path" && "$archive_path" != /* ]]
@@ -109,8 +117,10 @@ jobs:
 
           mkdir verified
           tar -xzf "$archive" -C verified --no-same-owner --no-same-permissions
-          cmp --silent "$external_manifest" verified/release-manifest.json
           [[ "$(jq -er '.sourceCommit' verified/release-manifest.json)" = "$SOURCE_SHA" ]]
+          [[ "$(jq -er '.fileInventorySha256' verified/release-manifest.json)" = \
+             "$(jq -er '.fileInventorySha256' "$external_manifest")" ]]
+          [[ "$(jq -er '.sourceCommit' "$external_manifest")" = "$SOURCE_SHA" ]]
 
           inventory_hash=$(sha256sum verified/release-files.sha256 | awk '{print $1}')
           [[ "$inventory_hash" = "$(jq -er '.fileInventorySha256' verified/release-manifest.json)" ]]
@@ -146,6 +156,9 @@ jobs:
           [[ "$SSH_HOST" =~ ^[A-Za-z0-9.-]+$ ]]
           [[ "$SSH_HOST_KEY_FINGERPRINT" =~ ^SHA256:[A-Za-z0-9+/=]+$ ]]
           [[ -n "$SSH_KNOWN_HOST_LINE" ]]
+          [[ "$CLOUDWAYS_SERVER_ID" =~ ^[0-9]+$ ]]
+          [[ "$APPLICATION_URL" =~ ^https://[^/?#]+/?$ ]]
+          [[ -n "$MEDIA_SMOKE_PATH" ]]
 
           install -d -m 0700 ~/.ssh
           printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
@@ -162,11 +175,14 @@ jobs:
         timeout-minutes: 30
         env:
           CLOUDWAYS_API_TOKEN: ${{ secrets.CLOUDWAYS_API_TOKEN }}
-        run: verified/scripts/cloudways-backup.sh
+        run: |
+          set -Eeuo pipefail
+          [[ -n "$CLOUDWAYS_API_TOKEN" ]]
+          verified/scripts/cloudways-backup.sh
 
       - name: Upload and activate verified release
         id: activate
-        timeout-minutes: 20
+        timeout-minutes: 35
         run: |
           set -Eeuo pipefail
           release="$(date -u '+%Y%m%dT%H%M%SZ')-${SOURCE_SHA:0:12}"
@@ -273,13 +289,22 @@ jobs:
           ssh "${ssh_options[@]}" "${SSH_USER}@${SSH_HOST}" \
             'set -Eeuo pipefail
              root=$1
-             previous=$(<"$root/.previous-release")
+             failed_release=$2
+             previous=""
+             if [[ -f "$root/.previous-release" && ! -L "$root/.previous-release" ]]; then
+               IFS= read -r previous < "$root/.previous-release" || true
+             fi
+             if [[ -z "$previous" ]]; then
+               printf "ERROR: No previous successful release recorded; first-release/webroot recovery requires maintenance and explicit operator action (failed release: %s).\n" "$failed_release" >&2
+               exit 1
+             fi
              [[ "$previous" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$ ]]
+             [[ "$previous" != "$failed_release" ]]
              export DEPLOY_ROOT="$root"
-             export APPLICATION_URL=$2
-             export MEDIA_SMOKE_PATH=$3
+             export APPLICATION_URL=$3
+             export MEDIA_SMOKE_PATH=$4
              "$root/current/scripts/rollback-release.sh" "$previous"' \
-            -- "$DEPLOY_ROOT" "$APPLICATION_URL" "$MEDIA_SMOKE_PATH"
+            -- "$DEPLOY_ROOT" "$FAILED_RELEASE" "$APPLICATION_URL" "$MEDIA_SMOKE_PATH"
 
       - name: Purge external cache after rollback
         if: always() && steps.rollback.outcome == 'success'

@@ -15,7 +15,7 @@ Create a GitHub Environment named `production`, restrict deployment branches to
 
 Secrets:
 
-- `PRODUCTION_SSH_PRIVATE_KEY`
+- `PRODUCTION_SSH_PRIVATE_KEY` (dedicated app-user deploy key for `ggpjvxscfe`)
 - `CLOUDWAYS_API_TOKEN`
 - A narrowly scoped package/source read credential only if explicit GHCR Actions
   access for this repository's `GITHUB_TOKEN` cannot be granted
@@ -23,18 +23,28 @@ Secrets:
 Variables:
 
 - `PRODUCTION_SSH_HOST`
-- `PRODUCTION_SSH_USER`
 - `PRODUCTION_SSH_PORT`
 - `PRODUCTION_SSH_KNOWN_HOST_LINE`
 - `PRODUCTION_SSH_HOST_KEY_FINGERPRINT`
-- `PRODUCTION_ROOT`
 - `APPLICATION_URL`
 - `MEDIA_SMOKE_PATH`
 - `CLOUDWAYS_SERVER_ID`
-- `CLOUDWAYS_APP_ID`
+
+Fixed in reviewed workflow code (not Environment inputs):
+
+- OCI package `ghcr.io/j-broadway/wp-agentic-test-production`
+- SSH user `ggpjvxscfe`
+- Cloudways app ID `6588863`
+- Canonical deploy root under the application `public_html`
 
 The known-host line and SHA-256 fingerprint must be obtained through a trusted
 channel. The workflow never runs `ssh-keyscan`.
+
+## Private package access
+
+Grant this public repository Actions access to the private GHCR package
+`wp-agentic-test-production` (package settings → Manage Actions access) before
+dispatching a real digest. Until that grant exists, digest pulls fail closed.
 
 ## Operating rule
 
@@ -43,3 +53,7 @@ the workflow from `main` with the exact candidate SHA and OCI digest recorded by
 the private artifact publication workflow. Start only one candidate at a time;
 GitHub concurrency prevents overlapping running deployments but is not a FIFO
 queue for pending runs.
+
+First-release or first-cutover failures with no recorded previous release require
+maintenance-mode recovery and explicit webroot restoration; the workflow fails
+closed instead of inventing a rollback target.
