@@ -105,19 +105,22 @@ jobs:
             [[ "$(jq -er '.archiveSha256' "$external_manifest")" = "$archive_hash" ]]
           fi
 
+          archive_names=$(mktemp)
+          archive_listing=$(mktemp)
+          trap 'rm -f "$archive_names" "$archive_listing"' EXIT
+          tar -tzf "$archive" > "$archive_names"
           while IFS= read -r archive_path; do
             archive_path=${archive_path#./}
+            [[ -z "$archive_path" ]] && continue
             [[ -n "$archive_path" && "$archive_path" != /* ]]
             [[ "$archive_path" != '..' && "$archive_path" != ../* && "$archive_path" != */../* ]]
-          done < <(tar -tzf "$archive")
-          archive_listing=$(mktemp)
-          trap 'rm -f "$archive_listing"' EXIT
+          done < "$archive_names"
           tar -tvzf "$archive" > "$archive_listing"
           if awk '$1 ~ /^[lh]/ { found=1 } END { exit !found }' "$archive_listing"; then
             printf 'Artifact contains links.\n' >&2
             exit 1
           fi
-          rm -f "$archive_listing"
+          rm -f "$archive_names" "$archive_listing"
           trap - EXIT
 
           mkdir verified
