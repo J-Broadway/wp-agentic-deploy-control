@@ -54,7 +54,7 @@ jobs:
       ARTIFACT_DIGEST: ${{ inputs.artifact_digest }}
       OCI_PACKAGE: ghcr.io/j-broadway/wp-agentic-test-production
       DEPLOY_ROOT: /home/1655427.cloudwaysapps.com/ggpjvxscfe/public_html
-      SSH_USER: ggpjvxscfe
+      SSH_USER: ${{ vars.PRODUCTION_SSH_USER }}
       SSH_HOST: ${{ vars.PRODUCTION_SSH_HOST }}
       SSH_PORT: ${{ vars.PRODUCTION_SSH_PORT }}
       SSH_KNOWN_HOST_LINE: ${{ vars.PRODUCTION_SSH_KNOWN_HOST_LINE }}
@@ -160,6 +160,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           [[ -n "$SSH_PRIVATE_KEY" ]]
+          [[ "$SSH_USER" =~ ^[A-Za-z_][A-Za-z0-9_-]{0,63}$ ]]
           [[ "$SSH_PORT" =~ ^[0-9]{1,5}$ ]]
           [[ "$SSH_HOST" =~ ^[A-Za-z0-9.-]+$ ]]
           [[ "$SSH_HOST_KEY_FINGERPRINT" =~ ^SHA256:[A-Za-z0-9+/=]+$ ]]
