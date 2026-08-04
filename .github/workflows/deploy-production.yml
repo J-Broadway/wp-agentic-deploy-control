@@ -63,6 +63,7 @@ jobs:
       MEDIA_SMOKE_PATH: ${{ vars.MEDIA_SMOKE_PATH }}
       CLOUDWAYS_SERVER_ID: ${{ vars.CLOUDWAYS_SERVER_ID }}
       CLOUDWAYS_APP_ID: '6588863'
+      CLOUDWAYS_PHP_FPM_SERVICE: ${{ vars.CLOUDWAYS_PHP_FPM_SERVICE }}
 
     steps:
       - name: Set up ORAS
@@ -166,6 +167,7 @@ jobs:
           [[ "$SSH_HOST_KEY_FINGERPRINT" =~ ^SHA256:[A-Za-z0-9+/=]+$ ]]
           [[ -n "$SSH_KNOWN_HOST_LINE" ]]
           [[ "$CLOUDWAYS_SERVER_ID" =~ ^[0-9]+$ ]]
+          [[ "$CLOUDWAYS_PHP_FPM_SERVICE" =~ ^php[0-9]+\.[0-9]+-fpm$ ]]
           [[ "$APPLICATION_URL" =~ ^https://[^/?#]+/?$ ]]
           [[ -n "$MEDIA_SMOKE_PATH" ]]
 
@@ -247,16 +249,26 @@ jobs:
              export APPLICATION_URL="$application_url"
              export MEDIA_SMOKE_PATH="$media_path"
              export RUNTIME_GROUP=www-data
+             export DEFER_POST_ACTIVATION=1
              "$root/releases/.incoming-$release/control/deploy-release.sh" "$release"' \
             -- "$DEPLOY_ROOT" "$release" "$APPLICATION_URL" "$MEDIA_SMOKE_PATH"
 
+      - name: Restart PHP-FPM after activation
+        id: fpm_restart
+        timeout-minutes: 5
+        env:
+          CLOUDWAYS_API_TOKEN: ${{ secrets.CLOUDWAYS_API_TOKEN }}
+        run: verified/scripts/cloudways-restart-fpm.sh
+
       - name: Purge Cloudways application cache
+        id: purge
         timeout-minutes: 5
         env:
           CLOUDWAYS_API_TOKEN: ${{ secrets.CLOUDWAYS_API_TOKEN }}
         run: verified/scripts/cloudways-purge-cache.sh
 
       - name: Verify production after external cache purge
+        id: verify
         timeout-minutes: 5
         env:
           RELEASE: ${{ steps.activate.outputs.release }}
@@ -276,12 +288,38 @@ jobs:
              export EXPECTED_RELEASE=$2
              export APPLICATION_URL=$3
              export MEDIA_SMOKE_PATH=$4
-             "$1/current/scripts/smoke-production.sh"' \
+             "$1/current/scripts/smoke-production.sh" --mark-success' \
             -- "$DEPLOY_ROOT" "$RELEASE" "$APPLICATION_URL" "$MEDIA_SMOKE_PATH"
+
+      - name: Prune old successful releases
+        id: prune
+        timeout-minutes: 5
+        run: |
+          set -Eeuo pipefail
+          ssh_options=(
+            -i "$HOME/.ssh/deploy_key"
+            -p "$SSH_PORT"
+            -o BatchMode=yes
+            -o IdentitiesOnly=yes
+            -o StrictHostKeyChecking=yes
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts"
+          )
+          ssh "${ssh_options[@]}" "${SSH_USER}@${SSH_HOST}" \
+            'set -Eeuo pipefail
+             export DEPLOY_ROOT=$1
+             "$1/current/scripts/prune-releases.sh"' \
+            -- "$DEPLOY_ROOT"
 
       - name: Roll back after post-activation failure
         id: rollback
-        if: failure() && steps.activate.outcome == 'success'
+        if: >-
+          always() &&
+          steps.activate.outcome == 'success' &&
+          (
+            steps.fpm_restart.outcome == 'failure' ||
+            steps.purge.outcome == 'failure' ||
+            steps.verify.outcome == 'failure'
+          )
         timeout-minutes: 10
         env:
           FAILED_RELEASE: ${{ steps.activate.outputs.release }}
@@ -295,7 +333,7 @@ jobs:
             -o StrictHostKeyChecking=yes
             -o UserKnownHostsFile="$HOME/.ssh/known_hosts"
           )
-          ssh "${ssh_options[@]}" "${SSH_USER}@${SSH_HOST}" \
+          previous=$(ssh "${ssh_options[@]}" "${SSH_USER}@${SSH_HOST}" \
             'set -Eeuo pipefail
              root=$1
              failed_release=$2
@@ -310,14 +348,49 @@ jobs:
              [[ "$previous" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$ ]]
              [[ "$previous" != "$failed_release" ]]
              export DEPLOY_ROOT="$root"
-             export APPLICATION_URL=$3
-             export MEDIA_SMOKE_PATH=$4
-             "$root/current/scripts/rollback-release.sh" "$previous"' \
-            -- "$DEPLOY_ROOT" "$FAILED_RELEASE" "$APPLICATION_URL" "$MEDIA_SMOKE_PATH"
+             export ROLLBACK_SKIP_RUNTIME_CHECKS=1
+             "$root/current/scripts/rollback-release.sh" "$previous" >&2
+             printf "%s" "$previous"' \
+            -- "$DEPLOY_ROOT" "$FAILED_RELEASE")
+          [[ "$previous" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$ ]]
+          printf 'release=%s\n' "$previous" >> "$GITHUB_OUTPUT"
 
-      - name: Purge external cache after rollback
+      - name: Restart PHP-FPM after rollback
+        id: fpm_restart_rollback
         if: always() && steps.rollback.outcome == 'success'
         timeout-minutes: 5
         env:
           CLOUDWAYS_API_TOKEN: ${{ secrets.CLOUDWAYS_API_TOKEN }}
+        run: verified/scripts/cloudways-restart-fpm.sh
+
+      - name: Purge external cache after rollback
+        id: purge_rollback
+        if: always() && steps.fpm_restart_rollback.outcome == 'success'
+        timeout-minutes: 5
+        env:
+          CLOUDWAYS_API_TOKEN: ${{ secrets.CLOUDWAYS_API_TOKEN }}
         run: verified/scripts/cloudways-purge-cache.sh
+
+      - name: Verify production after rollback
+        if: always() && steps.purge_rollback.outcome == 'success'
+        timeout-minutes: 5
+        env:
+          RELEASE: ${{ steps.rollback.outputs.release }}
+        run: |
+          set -Eeuo pipefail
+          ssh_options=(
+            -i "$HOME/.ssh/deploy_key"
+            -p "$SSH_PORT"
+            -o BatchMode=yes
+            -o IdentitiesOnly=yes
+            -o StrictHostKeyChecking=yes
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts"
+          )
+          ssh "${ssh_options[@]}" "${SSH_USER}@${SSH_HOST}" \
+            'set -Eeuo pipefail
+             export DEPLOY_ROOT=$1
+             export EXPECTED_RELEASE=$2
+             export APPLICATION_URL=$3
+             export MEDIA_SMOKE_PATH=$4
+             "$1/current/scripts/smoke-production.sh"' \
+            -- "$DEPLOY_ROOT" "$RELEASE" "$APPLICATION_URL" "$MEDIA_SMOKE_PATH"
