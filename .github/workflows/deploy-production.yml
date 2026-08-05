@@ -90,6 +90,13 @@ jobs:
           external_manifest="candidate/dist/release-manifest.json"
           [[ -f "$archive" && -f "$checksum" && -f "$external_manifest" ]]
 
+          # Redundant with the OCI digest: oras pull is content-addressed, so
+          # the archive bytes are already guaranteed by ARTIFACT_DIGEST. Kept
+          # as a cheap independent cross-check, and because archive_hash below
+          # reads from this checksum file rather than recomputing it. Without
+          # this check the archiveSha256 binding would compare two
+          # artifact-supplied values with nothing anchoring either to the
+          # actual archive. Remove both together or neither.
           (
             cd candidate/dist
             sha256sum --check --strict "wordpress-${SOURCE_SHA}.tar.gz.sha256"
